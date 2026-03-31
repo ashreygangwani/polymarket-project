@@ -1,0 +1,28 @@
+# Secrets — NEVER commit
+.env
+*.env
+polymarket_hft/.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data files (large/generated)
+polymarket_hft/data/
+*.csv
