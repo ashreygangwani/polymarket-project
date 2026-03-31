@@ -1218,14 +1218,35 @@ class LiveFarmerEngine:
 
         if not self.tte_halted and time_remaining_s < self.tte_killswitch_s:
             self.tte_halted = True
+            self._tte_last_flatten_attempt: float = 0.0
             await self._cancel_all_orders()
-            if self.yes_inventory_shares > 0 or self.no_inventory_shares > 0:
-                await self._flatten_all_inventory("TTE", fair_prob)
-                self.total_tte_flattens += 1
-                logger.info("TTE FLATTEN (DUAL) at %.0fs remaining.", time_remaining_s)
-            return
+            self.total_tte_flattens += 1
+            logger.info("TTE KILLSWITCH at %.0fs remaining.", time_remaining_s)
 
         if self.tte_halted:
+            # --- TTE Retry Loop ---
+            # Sync state from exchange first so inventory reflects reality.
+            await self._sync_order_state()
+
+            has_yes = self.yes_inventory_shares > 0.01
+            has_no = self.no_inventory_shares > 0.01
+
+            if not has_yes and not has_no:
+                # Inventory confirmed flat by exchange. Done.
+                return
+
+            # Retry flatten every 5 seconds until exchange confirms 0.
+            TTE_RETRY_INTERVAL_S = 5.0
+            last_attempt = getattr(self, "_tte_last_flatten_attempt", 0.0)
+            if now - last_attempt >= TTE_RETRY_INTERVAL_S:
+                self._tte_last_flatten_attempt = now
+                logger.info(
+                    "TTE RETRY: YES=%.2f NO=%.2f still held. "
+                    "Firing FOK flatten (tte=%.0fs).",
+                    self.yes_inventory_shares, self.no_inventory_shares,
+                    time_remaining_s,
+                )
+                await self._flatten_all_inventory("TTE_RETRY", fair_prob)
             return
 
         # --- Toxicity Shield (dynamic) ---
@@ -1764,7 +1785,12 @@ class LiveFarmerEngine:
     # ------------------------------------------------------------------
 
     async def _flatten_all_inventory(self, reason: str, fair_prob: float) -> None:
-        """Flatten BOTH YES and NO inventory via aggressive GTC limit orders."""
+        """Flatten BOTH YES and NO inventory via FOK market orders.
+
+        Does NOT modify local state (balance, inventory, cost basis).
+        State is updated by _sync_order_state() on the next tick when
+        the exchange confirms the fill.
+        """
         if self.yes_inventory_shares > 0:
             await self._flatten_token_inventory("yes", reason, fair_prob)
         if self.no_inventory_shares > 0:
@@ -1773,79 +1799,59 @@ class LiveFarmerEngine:
     async def _flatten_token_inventory(
         self, token: str, reason: str, fair_prob: float,
     ) -> None:
-        """Flatten inventory for a single token (YES or NO) via aggressive GTC cross.
+        """Fire-and-forget FOK SELL for a single token.
 
-        Places a GTC limit SELL order priced 5c below best bid to guarantee fill.
-        Falls back to FOK market order if GTC is rejected.
+        CRITICAL: This function does NOT modify self.balance,
+        self.yes_inventory_shares, self.no_inventory_shares, or cost basis.
+        The exchange is the source of truth. _sync_order_state() will
+        detect the actual fill and update state on the next tick.
+
+        If the FOK is rejected (thin book / slippage), the caller
+        (TTE retry loop) will re-attempt on the next cycle.
         """
         if token == "yes":
             shares = self.yes_inventory_shares
             token_id = self.token_id
-            cost_basis = self.yes_cost_basis
             token_fair = fair_prob
         else:
             shares = self.no_inventory_shares
             token_id = self.no_token_id
-            cost_basis = self.no_cost_basis
             token_fair = 1.0 - fair_prob
 
         if shares <= 0 or not token_id:
             return
 
-        # --- Fetch current BBO for aggressive pricing ---
-        best_bid = 0.0
-        try:
-            book = await asyncio.to_thread(
-                self.client.get_order_book, token_id,
-            )
-            bids = book.get("bids", [])
-            if bids:
-                best_bid = float(bids[0].get("price", 0))
-        except Exception as exc:
-            logger.warning("FLATTEN %s: book fetch failed (%s)", token.upper(), exc)
-
-        CROSS_OFFSET = 0.05
-        if best_bid > 0:
-            price = max(best_bid - CROSS_OFFSET, 0.01)
-        else:
-            price = max(token_fair - CROSS_OFFSET, 0.01)
-
-        price = round(max(0.01, min(0.99, price)), 2)
-
-        notional = shares * price
-        fee = notional * taker_fee_rate(price)
-        bal_change = notional - fee
-        pnl = bal_change - cost_basis
-
         if self.dry_run:
-            self.balance += bal_change
+            # In dry-run mode we DO zero out (no exchange to sync from).
+            notional = shares * token_fair
+            fee = notional * taker_fee_rate(token_fair)
+            self.balance += notional - fee
             self.total_taker_fees += fee
-            logger.info(
-                "DRY RUN: %s FLATTEN %s %.2f shares @ %.4f | "
-                "pnl=$%+.4f fee=$%.4f",
-                reason, token.upper(), shares, price, pnl, fee,
-            )
             if token == "yes":
                 self.yes_inventory_shares = 0.0
                 self.yes_cost_basis = 0.0
             else:
                 self.no_inventory_shares = 0.0
                 self.no_cost_basis = 0.0
+            logger.info(
+                "DRY RUN: %s FLATTEN %s %.2f shares @ %.4f",
+                reason, token.upper(), shares, token_fair,
+            )
             return
 
-        # --- Live: aggressive GTC SELL ---
+        # --- Live: FOK market order (fill-or-kill) ---
         try:
-            order_args = OrderArgs(
-                price=price,
-                size=shares,
-                side=SELL,
+            mkt_args = MarketOrderArgs(
                 token_id=token_id,
+                amount=shares,
+                side=SELL,
+                price=token_fair,
             )
             signed = await asyncio.to_thread(
-                self.client.create_order, order_args,
+                self.client.create_market_order, mkt_args,
             )
             resp = await asyncio.to_thread(
-                self.client.post_order, signed, OrderType.GTC,
+                self.client.post_order, signed, OrderType.FOK,
             )
 
             order_id = (
@@ -1854,61 +1860,28 @@ class LiveFarmerEngine:
                 or resp.get("order_id", "")
             )
             if order_id:
-                self.balance += bal_change
-                self.total_taker_fees += fee
-                if token == "yes":
-                    self.yes_inventory_shares = 0.0
-                    self.yes_cost_basis = 0.0
-                else:
-                    self.no_inventory_shares = 0.0
-                    self.no_cost_basis = 0.0
                 logger.info(
-                    "%s FLATTEN %s: SELL %.2f @ %.4f pnl=$%+.4f fee=$%.4f [GTC cross]",
-                    reason, token.upper(), shares, price, pnl, fee,
+                    "%s FLATTEN %s: FOK SELL %.2f shares @ fair=%.4f "
+                    "SUBMITTED (id=%s). Awaiting exchange confirmation.",
+                    reason, token.upper(), shares, token_fair,
+                    order_id[:16],
                 )
+                # Force an immediate state sync so the next tick sees
+                # the updated balance/inventory from the exchange.
+                self._last_order_sync = 0.0
             else:
-                # Fallback: FOK market order.
                 logger.warning(
-                    "%s FLATTEN %s GTC rejected → FOK fallback.",
-                    reason, token.upper(),
+                    "%s FLATTEN %s: FOK REJECTED (thin book?). "
+                    "%.2f shares still held. Will retry.",
+                    reason, token.upper(), shares,
                 )
-                mkt_args = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=shares,
-                    side=SELL,
-                    price=token_fair,
-                )
-                signed_fok = await asyncio.to_thread(
-                    self.client.create_market_order, mkt_args,
-                )
-                resp_fok = await asyncio.to_thread(
-                    self.client.post_order, signed_fok, OrderType.FOK,
-                )
-                if resp_fok.get("orderID"):
-                    fok_notional = shares * token_fair
-                    fok_fee = fok_notional * taker_fee_rate(token_fair)
-                    fok_bal = fok_notional - fok_fee
-                    fok_pnl = fok_bal - cost_basis
-                    self.balance += fok_bal
-                    self.total_taker_fees += fok_fee
-                    if token == "yes":
-                        self.yes_inventory_shares = 0.0
-                        self.yes_cost_basis = 0.0
-                    else:
-                        self.no_inventory_shares = 0.0
-                        self.no_cost_basis = 0.0
-                    logger.info(
-                        "%s FLATTEN %s (FOK): pnl=$%+.4f fee=$%.4f",
-                        reason, token.upper(), fok_pnl, fok_fee,
-                    )
-                else:
-                    logger.error(
-                        "%s FLATTEN %s FAILED: held to expiry.",
-                        reason, token.upper(),
-                    )
 
         except Exception as exc:
-            logger.error("%s FLATTEN %s error: %s", reason, token.upper(), exc)
+            logger.error(
+                "%s FLATTEN %s: FOK error: %s. "
+                "%.2f shares still held. Will retry.",
+                reason, token.upper(), exc, shares,
+            )
 
     # ------------------------------------------------------------------
     # Equity & Helpers
