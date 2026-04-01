@@ -1149,6 +1149,44 @@ class LiveFarmerEngine:
         This captures spread from BOTH directions without naked shorting.
         """
         now = time.time()
+
+        # --- MTM Macro Breaker (FIRST — before any API calls) ---
+        # If already tripped, return immediately. Zero REST polling.
+        if self.macro_breaker_tripped:
+            return
+
+        # Day boundary: reset breaker at midnight UTC.
+        current_day = int(now // 86400)
+        if current_day > self._current_day:
+            equity = self._compute_equity()
+            logger.info(
+                "=== DAY BOUNDARY | equity=$%.2f | pnl=$%+.2f ===",
+                equity, equity - self.day_start_equity,
+            )
+            self.day_start_equity = equity
+            self.macro_breaker_tripped = False
+            self._current_day = current_day
+
+        # Evaluate breaker before any REST calls.
+        equity = self._compute_equity()
+        daily_mtm_pnl = equity - self.day_start_equity
+
+        if daily_mtm_pnl <= self.macro_breaker_limit:
+            self.macro_breaker_tripped = True
+            fair_prob = max(0.02, min(0.98, self.state.fair_price))
+            await self._cancel_all_orders()
+            if self.yes_inventory_shares > 0 or self.no_inventory_shares > 0:
+                await self._flatten_all_inventory("BREAKER", fair_prob)
+            logger.warning(
+                "MTM BREAKER TRIPPED: day_pnl=$%.2f <= limit=$%.2f. "
+                "Shutting down engine.",
+                daily_mtm_pnl, self.macro_breaker_limit,
+            )
+            # Graceful full shutdown — terminates WS, heartbeat, rotation,
+            # and strategy loops. No more API polling.
+            asyncio.create_task(self.stop())
+            return
+
         fair_prob = self.state.fair_price
 
         if fair_prob <= 0.0 or fair_prob >= 1.0:
@@ -1175,35 +1213,6 @@ class LiveFarmerEngine:
                         gas_gwei, MAX_GAS_GWEI,
                     )
         if not self._gas_safe:
-            return
-
-        # --- Day Boundary: reset macro breaker ---
-        current_day = int(now // 86400)
-        if current_day > self._current_day:
-            equity = self._compute_equity()
-            logger.info(
-                "=== DAY BOUNDARY | equity=$%.2f | pnl=$%+.2f ===",
-                equity, equity - self.day_start_equity,
-            )
-            self.day_start_equity = equity
-            self.macro_breaker_tripped = False
-            self._current_day = current_day
-
-        # --- MTM Macro Breaker (every tick) ---
-        equity = self._compute_equity()
-        daily_mtm_pnl = equity - self.day_start_equity
-
-        if daily_mtm_pnl <= self.macro_breaker_limit and not self.macro_breaker_tripped:
-            self.macro_breaker_tripped = True
-            await self._cancel_all_orders()
-            if self.yes_inventory_shares > 0 or self.no_inventory_shares > 0:
-                await self._flatten_all_inventory("BREAKER", fair_prob)
-            logger.warning(
-                "MTM BREAKER: mtm_pnl=$%.2f. Halting until midnight.",
-                daily_mtm_pnl,
-            )
-
-        if self.macro_breaker_tripped:
             return
 
         # --- TTE Killswitch (DUAL) ---
