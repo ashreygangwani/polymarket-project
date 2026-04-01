@@ -15,11 +15,11 @@ Architecture: DUAL-TOKEN BID-ONLY
 Rules:
     Rule 1 -- 100% Maker: POST_ONLY BID entries only. Never cross to open.
     Rule 2 -- Toxicity Shield (dynamic): |CVD| > 15% of 10m vol OR |Z| > 2.0.
-    Rule 3 -- TTE Killswitch: Flatten BOTH tokens via taker at 20% remaining.
+    Rule 3 -- TTE Killswitch: FAK taker flatten at 20% remaining (60s).
     Rule 4 -- Per-Token Skew: $4 threshold → pause BID, place ASK to flatten.
     Rule 5 -- Grind Shield (dynamic): Pause side if CVD > 5% of 10m vol.
-    Rule 6 -- Time-Decay: Slam limits at 25% window remaining.
-    Rule 7 -- Zero-Edge Exit: Maker exit at fair_prob at 15% remaining.
+    Rule 6 -- Time-Decay: Slam limits at 50% window remaining (2m 30s).
+    Rule 7 -- Zero-Edge Exit: Maker exit at fair_prob at 40% remaining (2m).
 
 Risk Controls:
     $5 Daily MTM Circuit Breaker (mark-to-market, resets at 00:00 UTC).
@@ -91,9 +91,9 @@ VOLUME_WINDOW_S = 600.0                 # 10-minute rolling window for volume.
 CVD_WINDOW_S = 60.0                     # 60s rolling CVD window.
 
 # Window-relative fractions.
-TTE_KILLSWITCH_FRAC = 0.20              # Flatten at 20% remaining (60s for 5m).
-TIME_DECAY_FRAC = 0.25                  # Time decay at 25% remaining (was 50%).
-ZERO_EDGE_FRAC = 0.15                   # Zero-edge at 15% remaining (was 40%).
+TIME_DECAY_FRAC = 0.50                  # Begin decay at 50% remaining (2m 30s).
+ZERO_EDGE_FRAC = 0.40                   # Maker exit at 40% remaining (2m 00s).
+TTE_KILLSWITCH_FRAC = 0.20              # Taker flatten at 20% remaining (60s).
 
 # Volume-relative thresholds.
 TOXICITY_VOLUME_PCT = 0.15
@@ -1251,7 +1251,7 @@ class LiveFarmerEngine:
                 self._tte_last_flatten_attempt = now
                 logger.info(
                     "TTE RETRY: YES=%.2f NO=%.2f still held. "
-                    "Firing FOK flatten (tte=%.0fs).",
+                    "Firing FAK flatten (tte=%.0fs).",
                     self.yes_inventory_shares, self.no_inventory_shares,
                     time_remaining_s,
                 )
@@ -1848,7 +1848,10 @@ class LiveFarmerEngine:
             )
             return
 
-        # --- Live: FOK market order (fill-or-kill) ---
+        # --- Live: FAK market order (fill-and-kill / immediate-or-cancel) ---
+        # FAK allows partial fills against available liquidity, unlike FOK
+        # which rejects entirely on thin books. The TTE retry loop will
+        # clean up any unfilled remainder on the next 5-second cycle.
         try:
             mkt_args = MarketOrderArgs(
                 token_id=token_id,
@@ -1860,7 +1863,7 @@ class LiveFarmerEngine:
                 self.client.create_market_order, mkt_args,
             )
             resp = await asyncio.to_thread(
-                self.client.post_order, signed, OrderType.FOK,
+                self.client.post_order, signed, OrderType.FAK,
             )
 
             order_id = (
@@ -1870,7 +1873,7 @@ class LiveFarmerEngine:
             )
             if order_id:
                 logger.info(
-                    "%s FLATTEN %s: FOK SELL %.2f shares @ fair=%.4f "
+                    "%s FLATTEN %s: FAK SELL %.2f shares @ fair=%.4f "
                     "SUBMITTED (id=%s). Awaiting exchange confirmation.",
                     reason, token.upper(), shares, token_fair,
                     order_id[:16],
@@ -1880,7 +1883,7 @@ class LiveFarmerEngine:
                 self._last_order_sync = 0.0
             else:
                 logger.warning(
-                    "%s FLATTEN %s: FOK REJECTED (thin book?). "
+                    "%s FLATTEN %s: FAK REJECTED. "
                     "%.2f shares still held. Will retry.",
                     reason, token.upper(), shares,
                 )
