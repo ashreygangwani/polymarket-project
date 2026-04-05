@@ -99,9 +99,19 @@ TTE_KILLSWITCH_FRAC = 0.20              # Taker flatten at 20% remaining (60s).
 TOXICITY_VOLUME_PCT = 0.15
 GRIND_VOLUME_PCT = 0.05
 
+# Quote tolerance — don't cancel/replace if price drift < this.
+# Preserves queue position (time priority) on the order book.
+QUOTE_TOLERANCE = 0.002                 # 0.2 cents.
+
+# Skew shading — when inventory exceeds skew threshold, shade the bid
+# deeper into the book by this offset instead of pausing entirely.
+SKEW_SHADE_OFFSET = 0.02                # 2 cents deeper on skewed side.
+
 # Polymarket WebSocket.
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLY_WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 WS_PING_INTERVAL_S = 10.0
+FILL_RECONCILIATION_INTERVAL_S = 60.0   # Demoted REST _check_fills to 60s.
 WS_RECONNECT_DELAY_S = 1.0
 WS_RECONNECT_MAX_DELAY_S = 30.0
 WS_RECONNECT_BACKOFF_FACTOR = 2.0
@@ -738,8 +748,11 @@ class LiveFarmerEngine:
         self._current_market: MarketInfo | None = None
         self._rotation_pending: bool = False
         self._ws_task: asyncio.Task | None = None
+        self._ws_user_task: asyncio.Task | None = None
         self._strategy_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._ws_fill_sync_needed: bool = False
+        self._last_check_fills_ts: float = 0.0
         self._total_rotations: int = 0
 
     # ------------------------------------------------------------------
@@ -851,13 +864,16 @@ class LiveFarmerEngine:
         self._ws_task = asyncio.create_task(
             self._ws_trade_listener(), name="ws_trades",
         )
+        self._ws_user_task = asyncio.create_task(
+            self._ws_user_listener(), name="ws_user_fills",
+        )
         self._strategy_task = asyncio.create_task(
             self._strategy_loop(), name="strategy_loop",
         )
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="heartbeat",
         )
-        self._tasks = [self._ws_task, self._strategy_task, self._heartbeat_task]
+        self._tasks = [self._ws_task, self._ws_user_task, self._strategy_task, self._heartbeat_task]
 
         # Launch rotation watcher if auto-rotating.
         if self._auto_rotate:
@@ -1022,6 +1038,107 @@ class LiveFarmerEngine:
                 return
             except Exception:
                 return
+
+    async def _ws_user_listener(self) -> None:
+        """
+        Authenticated WS connection for real-time fill detection.
+
+        Subscribes to the user channel with API credentials. On trade events
+        (our fills), sets _ws_fill_sync_needed so _strategy_tick triggers an
+        immediate _sync_order_state instead of waiting for the next REST poll.
+        """
+        api_key = os.getenv("CLOB_API_KEY", "")
+        api_secret = os.getenv("CLOB_SECRET", "")
+        api_passphrase = os.getenv("CLOB_PASS_PHRASE", "")
+
+        if not (api_key and api_secret and api_passphrase):
+            logger.warning("WS User: No API credentials — fill WS disabled.")
+            return
+
+        delay = WS_RECONNECT_DELAY_S
+
+        while self._running:
+            try:
+                condition_id = (
+                    self._current_market.condition_id
+                    if self._current_market else ""
+                )
+                if not condition_id:
+                    await asyncio.sleep(2.0)
+                    continue
+
+                async with websockets.connect(
+                    POLY_WS_USER_URL,
+                    ping_interval=None,
+                ) as ws:
+                    # Authenticate and subscribe.
+                    sub_msg = json.dumps({
+                        "auth": {
+                            "apiKey": api_key,
+                            "secret": api_secret,
+                            "passphrase": api_passphrase,
+                        },
+                        "markets": [condition_id],
+                        "type": "user",
+                    })
+                    await ws.send(sub_msg)
+                    logger.info(
+                        "WS User subscribed (condition=%s...)",
+                        condition_id[:16],
+                    )
+
+                    delay = WS_RECONNECT_DELAY_S
+
+                    # Keepalive ping task.
+                    ping_task = asyncio.create_task(
+                        self._ws_ping_keepalive(ws), name="ws_user_ping",
+                    )
+
+                    try:
+                        async for raw_msg in ws:
+                            if raw_msg == "PONG":
+                                continue
+                            try:
+                                data = json.loads(raw_msg)
+                            except json.JSONDecodeError:
+                                continue
+
+                            events = data if isinstance(data, list) else [data]
+                            for evt in events:
+                                evt_type = evt.get("event_type", "")
+                                if evt_type == "trade":
+                                    # Our order was filled — trigger sync.
+                                    self._ws_fill_sync_needed = True
+                                    maker_orders = evt.get("maker_orders", [])
+                                    for mo in maker_orders:
+                                        logger.info(
+                                            "WS FILL: order=%s amt=%s price=%s status=%s",
+                                            mo.get("order_id", "?")[:12],
+                                            mo.get("matched_amount", "?"),
+                                            mo.get("price", "?"),
+                                            mo.get("status", "?"),
+                                        )
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except (
+                websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.WebSocketException,
+                OSError,
+                asyncio.CancelledError,
+            ) as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    return
+                logger.warning("WS User disconnected: %s", exc)
+
+            if self._running:
+                logger.info("WS User reconnecting in %.0fs...", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * WS_RECONNECT_BACKOFF_FACTOR, WS_RECONNECT_MAX_DELAY_S)
 
     def _handle_ws_message(self, raw: str) -> None:
         """Parse a Polymarket WebSocket message and feed trades to state."""
@@ -1197,8 +1314,18 @@ class LiveFarmerEngine:
         no_fair = 1.0 - fair_prob  # Binary complement.
 
         # --- Fill Detection & Order State Sync ---
-        await self._check_fills(fair_prob)
-        await self._sync_order_state()
+        # WS user channel triggers immediate sync on fill events.
+        if self._ws_fill_sync_needed:
+            self._ws_fill_sync_needed = False
+            await self._sync_order_state()
+            logger.debug("WS-triggered sync complete.")
+        else:
+            await self._sync_order_state()
+
+        # REST _check_fills demoted to 60s reconciliation (log-only).
+        if now - self._last_check_fills_ts >= FILL_RECONCILIATION_INTERVAL_S:
+            self._last_check_fills_ts = now
+            await self._check_fills(fair_prob)
 
         # --- Gas Guard ---
         if now - self._last_gas_check > GAS_CHECK_INTERVAL_S:
@@ -1333,11 +1460,12 @@ class LiveFarmerEngine:
             want_no_bid = False
             self.total_grind_pauses += 1
 
-        # --- Apply skew overrides ---
+        # --- Apply skew overrides (shade, don't pause) ---
         if yes_skewed:
-            want_yes_bid = False
-            # Place ASK to flatten YES inventory.
-            yes_ask_price = max(fair_prob, 0.01)  # At fair or better.
+            # Shade YES bid deeper into book instead of pausing.
+            yes_bid_price = max(fair_prob - self.half_spread - SKEW_SHADE_OFFSET, 0.01)
+            # Place YES ASK competitively at fair to unwind.
+            yes_ask_price = max(fair_prob, 0.01)
             await self._place_skew_ask("yes", yes_ask_price, self.yes_inventory_shares)
         else:
             # Cancel any lingering YES ASK if skew resolved.
@@ -1346,7 +1474,9 @@ class LiveFarmerEngine:
                 self.yes_ask_order = None
 
         if no_skewed:
-            want_no_bid = False
+            # Shade NO bid deeper into book instead of pausing.
+            no_bid_price = max(no_fair - self.half_spread - SKEW_SHADE_OFFSET, 0.01)
+            # Place NO ASK competitively at fair to unwind.
             no_ask_price = max(no_fair, 0.01)
             await self._place_skew_ask("no", no_ask_price, self.no_inventory_shares)
         else:
@@ -1632,17 +1762,21 @@ class LiveFarmerEngine:
         """
         Place POST_ONLY BID on YES and BID on NO simultaneously.
 
-        This is the core of the Dual-Token Bid-Only architecture:
-        instead of Bid+Ask on one token, we Bid on BOTH tokens.
-        fair_yes + fair_no = 1.00, so we capture spread from both sides.
+        Uses QUOTE_TOLERANCE to protect queue position: if the resting
+        order is within tolerance of the new theoretical price, we keep
+        it to maintain time priority instead of cancel/replacing.
         """
         # --- YES BID management ---
-        if self.yes_bid_order is not None and (
-            yes_bid_price is None
-            or abs(self.yes_bid_order.price - yes_bid_price) > 0.0001
-        ):
-            await self._cancel_order(self.yes_bid_order)
-            self.yes_bid_order = None
+        if self.yes_bid_order is not None:
+            if yes_bid_price is None:
+                # Want to cancel entirely.
+                await self._cancel_order(self.yes_bid_order)
+                self.yes_bid_order = None
+            elif abs(self.yes_bid_order.price - yes_bid_price) > QUOTE_TOLERANCE:
+                # Price drifted outside tolerance — must replace.
+                await self._cancel_order(self.yes_bid_order)
+                self.yes_bid_order = None
+            # else: within tolerance, keep resting order for queue priority.
 
         if yes_bid_price is not None and self.yes_bid_order is None:
             size_usdc = min(self.maker_size_usdc, self.balance * 0.45)
@@ -1654,12 +1788,13 @@ class LiveFarmerEngine:
                 )
 
         # --- NO BID management ---
-        if self.no_bid_order is not None and (
-            no_bid_price is None
-            or abs(self.no_bid_order.price - no_bid_price) > 0.0001
-        ):
-            await self._cancel_order(self.no_bid_order)
-            self.no_bid_order = None
+        if self.no_bid_order is not None:
+            if no_bid_price is None:
+                await self._cancel_order(self.no_bid_order)
+                self.no_bid_order = None
+            elif abs(self.no_bid_order.price - no_bid_price) > QUOTE_TOLERANCE:
+                await self._cancel_order(self.no_bid_order)
+                self.no_bid_order = None
 
         if no_bid_price is not None and self.no_bid_order is None and self.no_token_id:
             size_usdc = min(self.maker_size_usdc, self.balance * 0.45)
@@ -2242,7 +2377,7 @@ class LiveFarmerEngine:
         await self._cancel_all_orders()
 
         # 2. Stop WS and strategy tasks (keep heartbeat running).
-        for task in [self._ws_task, self._strategy_task]:
+        for task in [self._ws_task, self._ws_user_task, self._strategy_task]:
             if task and not task.done():
                 task.cancel()
                 try:
@@ -2381,6 +2516,9 @@ class LiveFarmerEngine:
         self._ws_task = asyncio.create_task(
             self._ws_trade_listener(), name="ws_trades",
         )
+        self._ws_user_task = asyncio.create_task(
+            self._ws_user_listener(), name="ws_user_fills",
+        )
         self._strategy_task = asyncio.create_task(
             self._strategy_loop(), name="strategy_loop",
         )
@@ -2390,7 +2528,7 @@ class LiveFarmerEngine:
             t for t in self._tasks
             if t and not t.done()
         ]
-        self._tasks.extend([self._ws_task, self._strategy_task])
+        self._tasks.extend([self._ws_task, self._ws_user_task, self._strategy_task])
 
         self._rotation_pending = False
         logger.info("Rotation complete. Trading on new market.")
